@@ -35,12 +35,18 @@ def censoring_LMMSE_loss_Weibull(beta, gam2, r2, tau2, X, p2, mu, alpha, X_c, y_
     # return np.sum(term**2)
     return term
 
-def censoring_LMMSE_loss_Weibull_grad(beta, gam2, r2, tau2, X, p2, mu, alpha, X_c, y_c):
+def censoring_LMMSE_loss_Weibull_grad(beta, gam2, r2, tau2, X, p2, mu, alpha, X_c, y_c, XTX=None):
     r2 = r2.squeeze(-1)
     p2 = p2.squeeze(-1)
     y_c = y_c.squeeze(-1)
     _, m = X.shape
-    term1 = 2 * (gam2 * np.identity(m) + tau2*X.T@X)
+    # X is constant across VAMP iterations, so X.T@X (an O(n*m^2) product) can be
+    # computed once by the caller and passed in via XTX instead of being recomputed
+    # here on every call (this function may now be called many times per VAMP
+    # iteration, once per fsolve Newton step, when used as fsolve's fprime).
+    if XTX is None:
+        XTX = X.T @ X
+    term1 = 2 * (gam2 * np.identity(m) + tau2*XTX)
     hazard_eval = hazard_func_Weibull(alpha*(np.log(y_c)- mu - X_c@beta) - emc)
     Dh = np.diag(np.diag(hazard_eval))
     term2 = alpha**2 * X_c.T @ Dh @ X_c

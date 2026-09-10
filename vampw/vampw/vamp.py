@@ -5,6 +5,7 @@ from .censoring import *
 import sympy
 from scipy.sparse.linalg import cg as con_grad
 from scipy.optimize import minimize
+import scipy.linalg
 from numpy.random import binomial
 import random  # This ensures you're using Python's built-in random module.
 from datetime import datetime
@@ -36,7 +37,7 @@ def infere_and_visualize(data, problem, pref, seed=42, maxiter=10, h2_title=None
                  f"{n}x{m}, heritability: {h2_title}, X distr: " + distr + f", sparsity: {1-prior.la}; mode: {pref['mode']}; dampen_coeff: {pref['dampen_coeff']}")     
     print_summaries(mus, alphas, corrs_x, corrs_z, l2_errs_x, l2_errs_z)
 
-def infere(data, problem, pref, seed=42, maxiter=10, load_svd=False, censoring_fsolve_tol=1e-8, print_fsolve_state=False):
+def infere(data, problem, pref, seed=42, maxiter=10, load_svd=False, censoring_fsolve_tol=1e-5, print_fsolve_state=False):
 
     np.random.seed(seed)
 
@@ -67,6 +68,8 @@ def infere(data, problem, pref, seed=42, maxiter=10, load_svd=False, censoring_f
         num_hutchinson_samples = -1
     else:
         num_hutchinson_samples = int(pref["num_hutchinson_samples"])
+
+    print(f"num_hutchinson_samples = {num_hutchinson_samples}", flush=True)
 
     # starting values of the precisions
     denoiser_type = pref["denoiser_type"]
@@ -100,7 +103,12 @@ def infere(data, problem, pref, seed=42, maxiter=10, load_svd=False, censoring_f
     elif mode=='censoring':
         X_c = data["X_c"]
         y_c = data["y_c"]
-        
+        # X is constant across VAMP iterations, so compute X.T@X (O(n*m^2)) once here
+        # instead of recomputing it every iteration (line ~260 below) and on every
+        # fsolve Newton step (censoring_LMMSE_loss_Weibull_grad, now used as fprime).
+        XTX_censoring = X.T @ X
+        x2_hat_prev_censoring = np.zeros(m)
+
     
     if is_synthetic: Xbeta_true = X @ beta_true
 
@@ -123,6 +131,9 @@ def infere(data, problem, pref, seed=42, maxiter=10, load_svd=False, censoring_f
     lams = [problem.prior_instance.la]
     sigmas = [problem.prior_instance.sigmas]
     omegas = [problem.prior_instance.omegas]
+    mu_list = []
+    alpha_list = []
+    ci_train_list = []
     
     for it in range(maxiter):
         start_time = time.time()
@@ -152,7 +163,7 @@ def infere(data, problem, pref, seed=42, maxiter=10, load_svd=False, censoring_f
         x1_hat = x1_hat_damped
         ci_train_prev = ci_train
         x1_hats.append(x1_hat)
-        if print_results: print("x1_hat[2] = ", x1_hat[2])
+        ci_train_list.append(ci_train)
         
         ############################################################
         if is_synthetic:
@@ -215,6 +226,8 @@ def infere(data, problem, pref, seed=42, maxiter=10, load_svd=False, censoring_f
         problem.hyperparams_instance.update(y=y, z_hat=z1_hat, xi=predicted_xi, it=it, update_preference=pref)
         mu, alpha = problem.hyperparams_instance.mu, problem.hyperparams_instance.alpha
         print(f"Updated mu = {mu} -- update alpha = {alpha}", flush=True)
+        mu_list.append(mu)
+        alpha_list.append(alpha)
         
         # LMMSE estimation of x
         if print_results: print("->LMMSE")
@@ -250,13 +263,21 @@ def infere(data, problem, pref, seed=42, maxiter=10, load_svd=False, censoring_f
             beta2 = (1-alpha2) * m / n
 
         elif mode=='censoring':
-            initial_guess, _ = con_grad(gam2 * np.eye(m) + tau2 * X.T@X, tau2 * X.T @ p2 + gam2 * r2, maxiter=500, x0=np.zeros(m))
+            # initial_guess, _ = con_grad(gam2 * np.eye(m) + tau2 * XTX_censoring, tau2 * X.T @ p2 + gam2 * r2, maxiter=500, x0=np.zeros(m))
+            initial_guess, _ = con_grad(gam2 * np.eye(m) + tau2 * XTX_censoring, tau2 * X.T @ p2 + gam2 * r2, maxiter=500, x0=x2_hat_prev_censoring)
+            def _censoring_LMMSE_loss_Weibull_grad_fprime(beta, gam2, r2, tau2, X, p2, mu, alpha, X_c, y_c):
+                beta = np.asarray(beta).reshape((m, 1))
+                return censoring_LMMSE_loss_Weibull_grad(beta, gam2, r2, tau2, X, p2, mu, alpha, X_c, y_c, XTX=XTX_censoring)
+
+            # x2_hat, info, status, message = scipy.optimize.fsolve(censoring_LMMSE_loss_Weibull, x0=initial_guess, args=(gam2, r2, tau2, X, p2, mu, alpha, X_c, y_c),\
+            # full_output=1 , xtol=censoring_fsolve_tol)
             x2_hat, info, status, message = scipy.optimize.fsolve(censoring_LMMSE_loss_Weibull, x0=initial_guess, args=(gam2, r2, tau2, X, p2, mu, alpha, X_c, y_c),\
-            full_output=1 , xtol=censoring_fsolve_tol)
+            fprime=_censoring_LMMSE_loss_Weibull_grad_fprime, full_output=1 , xtol=censoring_fsolve_tol)
             if print_fsolve_state:
                 print(f"fsolve status : {status}")
                 print(f"fsolve message : {message}", flush=True)
             x2_hat.resize((m,1))
+            x2_hat_prev_censoring = x2_hat.squeeze(-1)
             x2_hats.append(x2_hat)
             if print_results: print(f"Norm of x2_hat = {np.linalg.norm(x2_hat)}", flush=True)
             ###########################################################################
@@ -270,18 +291,28 @@ def infere(data, problem, pref, seed=42, maxiter=10, load_svd=False, censoring_f
                     print("l2 error for x2_hat = ", l2_err)
             ##########################################################################
                 
-            LMMSE_jacob_censoring = censoring_LMMSE_loss_Weibull_grad(x2_hat, gam2, r2, tau2, X, p2, mu, alpha, X_c, y_c)
+            LMMSE_jacob_censoring = censoring_LMMSE_loss_Weibull_grad(x2_hat, gam2, r2, tau2, X, p2, mu, alpha, X_c, y_c, XTX=XTX_censoring)
             if num_hutchinson_samples > 0:
-                alpha2, beta2 = 0.0, 0.0
-                for ind_sample in range(num_hutchinson_samples):
-                    u = binomial(p=1/2, n=1, size=m) * 2 - 1
-                    inv_LMMSE_jacob_censoring_vec, _ = con_grad(LMMSE_jacob_censoring,u, maxiter=500, x0=np.zeros(m))
-                    alpha2 += 2 * gam2 * np.dot(u, inv_LMMSE_jacob_censoring_vec) / m
-                    u = binomial(p=1/2, n=1, size=n) * 2 - 1
-                    inv_X_LMMSE_jacob_censoring_XT_vec, _ = con_grad(X @ LMMSE_jacob_censoring @ X.T,u, maxiter=500, x0=np.zeros(n))
-                    beta2 += 2 * tau2 * np.dot(u, inv_X_LMMSE_jacob_censoring_XT_vec)/ n
-                alpha2 /= num_hutchinson_samples
-                beta2 /= num_hutchinson_samples
+                print("Starting Hutchinson estimator", flush=True)
+                # LMMSE_jacob_censoring is a dense (m,m) matrix shared by all probes, so
+                # solve for every probe's RHS in one batched linear solve instead of
+                # looping over num_hutchinson_samples separate CG calls. This reuses a
+                # single factorization of the matrix and lets BLAS/LAPACK parallelize
+                # across cores internally (controlled via OMP_NUM_THREADS /
+                # OPENBLAS_NUM_THREADS / MKL_NUM_THREADS).
+                U_alpha = binomial(p=1/2, n=1, size=(m, num_hutchinson_samples)) * 2 - 1
+                U_beta = binomial(p=1/2, n=1, size=(n, num_hutchinson_samples)) * 2 - 1
+                XT_U_beta = X.T @ U_beta  # estimate Tr(X J^-1 X^T)
+
+                RHS = np.hstack([U_alpha, XT_U_beta])
+                # SOL = np.linalg.solve(LMMSE_jacob_censoring, RHS)
+                c_and_lower = scipy.linalg.cho_factor(LMMSE_jacob_censoring)
+                SOL = scipy.linalg.cho_solve(c_and_lower, RHS)
+                Sol_alpha = SOL[:, :num_hutchinson_samples]
+                Sol_beta = SOL[:, num_hutchinson_samples:]
+
+                alpha2 = 2 * gam2 * np.einsum('ij,ij->j', U_alpha, Sol_alpha).mean() / m
+                beta2 = 2 * tau2 * np.einsum('ij,ij->j', XT_U_beta, Sol_beta).mean() / n
             else:
                 inv_LMMSE_jacob_censoring = np.linalg.inv(LMMSE_jacob_censoring)
                 alpha2 = 2 * gam2 * np.trace( inv_LMMSE_jacob_censoring ) / m
@@ -346,6 +377,6 @@ def infere(data, problem, pref, seed=42, maxiter=10, load_svd=False, censoring_f
     output = {'x1_hats': x1_hats, 'gam1s': gam1s, 'tau1s': tau1s, 'corrs_x': corrs_x, 'corrs_z': corrs_z, \
               'actual_xis': actual_xis, 'predicted_xis': predicted_xis, 'z1_hats': z1_hats, \
               'r1s': r1s, 'p1s':p1s, 'l2_errs_x': l2_errs_x, 'l2_errs_z': l2_errs_z, 'l2_errs_x2': l2_errs_x2, \
-              'x2_hats': x2_hats, 'corrs_x2': corrs_x2, 'lambdas': lams, 'sigmas': sigmas, 'omegas': omegas}
+              'x2_hats': x2_hats, 'corrs_x2': corrs_x2, 'lambdas': lams, 'sigmas': sigmas, 'omegas': omegas, 'mus': mu_list, 'alphas': alpha_list, 'ci_train': ci_train_list}
 
     return output
