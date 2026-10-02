@@ -33,6 +33,10 @@ srun python3 vampw_pipeline.py \
 
 | Parameter | Default | Description |
 |---|---:|---|
+| `--X-train` | `None` | Training design matrix. |
+| `--phen-train` | `None` | Training phenotype file. |
+| `--X-test` | `None` | Test design matrix. |
+| `--phen-test` | `None` | Test phenotype file. |
 | `--rho` | `0.3` | Damping parameter |
 | `--adaptive-rho` | `0` | Enable adaptive damping |
 | `--rho-wu-it` | `-1` | Warm-up iterations for adaptive damping |
